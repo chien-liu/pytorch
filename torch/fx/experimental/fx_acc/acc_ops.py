@@ -10,7 +10,6 @@ from torch.fx.experimental.fx_acc.acc_normalizer import (
     register_acc_op_mapping,
     register_custom_acc_mapper_fn,
 )
-from torch.fx.passes.shape_prop import _extract_tensor_metadata
 
 this_arg_is_optional = True
 
@@ -389,30 +388,26 @@ def min_single_tensor_input(*, input):
 def min_two_tensors_input(*, input, other):
     return torch.min(input, other)
 
-@register_acc_op_mapping(
-    op_and_target=("call_function", torch.quantize_per_tensor),
-    arg_replacement_tuples=[
-        ("input", "input"),
-        ("scale", "scale"),
-        ("zero_point", "zero_point"),
-        ("dtype", "dtype"),
-    ],
-    kwargs_to_move_to_acc_out_ty=[
-        ("dtype", "dtype"),
-        ("scale", "q_scale"),
-        ("zero_point", "q_zero_point"),
-    ],
-)
 @register_acc_op
-def quantize_per_tensor(*, input, acc_out_ty=None):
+def quantize_per_tensor(*, input, qparams=None):
     assert acc_out_ty is not None
     return torch.quantize_per_tensor(
         input,
-        acc_utils.get_field_from_acc_out_ty(acc_out_ty, "q_scale"),
-        acc_utils.get_field_from_acc_out_ty(acc_out_ty, "q_zero_point"),
-        acc_utils.get_field_from_acc_out_ty(acc_out_ty, "dtype"),
+        qparams["scale"],
+        qparams["zero_point"],
+        qparams["dtype"]
     )
 
+@register_acc_op
+def quantize_per_channel(*, input, qparams=None):
+    assert acc_out_ty is not None
+    return torch.quantize_per_tensor(
+        input,
+        qparams["scale"],
+        qparams["zero_point"],
+        qparams["axis"],
+        qparams["dtype"]
+    )
 
 @register_acc_op
 def dequantize(*, input, input_tensor_meta):
@@ -997,6 +992,54 @@ def custom_torch_add_mapper(node: torch.fx.Node, mod: nn.Module) -> torch.fx.Nod
 
         new_node = node.graph.create_node(
             "call_function", add, kwargs=add_kwargs, name=node.name
+        )
+        new_node.meta = node.meta
+        return new_node
+
+@register_custom_acc_mapper_fn(
+    op_and_target=("call_function", torch.quantize_per_tensor),
+    arg_replacement_tuples=[
+        ("input", "input"),
+        ("scale", "scale"),
+        ("zero_point", "zero_point"),
+        ("dtype", "dtype"),
+    ],
+)
+def custom_quantize_per_tensor_mapper(node: torch.fx.Node, mod: nn.Module) -> torch.fx.Node:
+    qparams = {}
+    qparams["qscheme"] = torch.per_tensor_affine
+    qparams["scale"] = node.kwargs["scale"]
+    qparams["zero_point"] = node.kwargs["zero_point"]
+    qparams["dtype"] = node.kwargs["dtype"]
+    new_kwargs = {"input": node.kwargs["input"], "qparams": qparams}
+    with node.graph.inserting_before(node):
+        new_node = node.graph.create_node(
+            "call_function", quantize_per_tensor, kwargs=new_kwargs, name=node.name
+        )
+        new_node.meta = node.meta
+        return new_node
+
+@register_custom_acc_mapper_fn(
+    op_and_target=("call_function", torch.quantize_per_channel),
+    arg_replacement_tuples=[
+        ("input", "input"),
+        ("scale", "scale"),
+        ("zero_point", "zero_point"),
+        ("axis", "axis"),
+        ("dtype", "dtype"),
+    ],
+)
+def custom_quantize_per_channel_mapper(node: torch.fx.Node, mod: nn.Module) -> torch.fx.Node:
+    qparams = {}
+    qparams["qscheme"] = torch.per_tensor_affine
+    qparams["scale"] = node.kwargs["scale"]
+    qparams["zero_point"] = node.kwargs["zero_point"]
+    qparams["axis"] = node.kwargs["axis"]
+    qparams["dtype"] = node.kwargs["dtype"]
+    new_kwargs = {"input": node.kwargs["input"], "qparams": qparams}
+    with node.graph.inserting_before(node):
+        new_node = node.graph.create_node(
+            "call_function", quantize_per_channel, kwargs=new_kwargs, name=node.name
         )
         new_node.meta = node.meta
         return new_node
